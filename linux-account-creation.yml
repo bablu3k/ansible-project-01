@@ -1,6 +1,6 @@
 ---
 - name: Create Linux user account
-  hosts: linux01
+  hosts: linux
   become: true
   gather_facts: false
 
@@ -15,10 +15,10 @@
     - name: Validate username
       ansible.builtin.assert:
         that:
-          - linux_username is defined
-          - linux_username | length > 0
-          - linux_username is match('^[a-z_][a-z0-9_-]{0,31}$')
-        fail_msg: "Invalid Linux username: {{ linux_username }}"
+          - linux_username | default('') | length > 0
+          - linux_username | default('') is match('^[a-z_][a-z0-9_-]{0,31}$')
+        fail_msg: "linux_username was not provided or is invalid."
+        success_msg: "Username {{ linux_username }} is valid."
 
   tasks:
 
@@ -26,8 +26,8 @@
       ansible.builtin.user:
         name: "{{ linux_username }}"
         comment: "{{ linux_fullname | default(linux_username) }}"
-        shell: "{{ linux_shell }}"
-        groups: "{{ linux_groups if linux_groups | length > 0 else omit }}"
+        shell: "{{ linux_shell | default('/bin/bash') }}"
+        groups: "{{ linux_groups if linux_groups | default('') | length > 0 else omit }}"
         append: true
         create_home: true
         state: present
@@ -39,8 +39,7 @@
         state: present
         manage_dir: true
       when:
-        - linux_ssh_public_key is defined
-        - linux_ssh_public_key | trim | length > 0
+        - linux_ssh_public_key | default('') | trim | length > 0
 
     - name: Configure passwordless sudo
       ansible.builtin.copy:
@@ -50,13 +49,13 @@
         group: root
         mode: "0440"
         validate: "/usr/sbin/visudo -cf %s"
-      when: linux_sudo | bool
+      when: linux_sudo | default(false) | bool
 
-    - name: Remove sudo configuration when sudo is disabled
+    - name: Remove sudo configuration when sudo disabled
       ansible.builtin.file:
         path: "/etc/sudoers.d/{{ linux_username }}"
         state: absent
-      when: not (linux_sudo | bool)
+      when: not (linux_sudo | default(false) | bool)
 
     - name: Verify account
       ansible.builtin.command:
