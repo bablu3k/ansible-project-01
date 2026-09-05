@@ -1,6 +1,6 @@
 ---
 - name: Create Linux user account
-  hosts: linux
+  hosts: linux01
   become: true
   gather_facts: false
 
