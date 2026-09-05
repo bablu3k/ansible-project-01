@@ -1,0 +1,374 @@
+---
+- name: Collect Linux user account compliance
+  hosts: linux
+  become: true
+  gather_facts: true
+
+  vars:
+    # false = root + normal human users based on UID_MIN
+    # true  = include service/system accounts too
+    include_system_accounts: false
+
+  tasks:
+
+    - name: Install temporary Linux compliance collector
+      ansible.builtin.copy:
+        dest: /tmp/linux_user_compliance.py
+        owner: root
+        group: root
+        mode: "0700"
+        content: |
+          #!/usr/bin/python3
+
+          import datetime
+          import grp
+          import json
+          import os
+          import pwd
+          import subprocess
+
+          INCLUDE_SYSTEM = {{ include_system_accounts | bool | lower }}
+
+          def run(command):
+              try:
+                  result = subprocess.run(
+                      command,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      timeout=20
+                  )
+                  return result.returncode, result.stdout.strip()
+              except Exception as exc:
+                  return 1, str(exc)
+
+          def get_uid_min():
+              uid_min = 1000
+
+              try:
+                  with open("/etc/login.defs", "r") as f:
+                      for line in f:
+                          line = line.strip()
+
+                          if line.startswith("UID_MIN"):
+                              parts = line.split()
+
+                              if len(parts) >= 2:
+                                  uid_min = int(parts[1])
+                                  break
+              except Exception:
+                  pass
+
+              return uid_min
+
+          def load_shadow():
+              shadow = {}
+
+              try:
+                  with open("/etc/shadow", "r") as f:
+                      for line in f:
+                          fields = line.rstrip("\n").split(":")
+
+                          if len(fields) >= 9:
+                              shadow[fields[0]] = fields
+              except Exception:
+                  pass
+
+              return shadow
+
+          def shadow_day_to_date(value):
+              try:
+                  days = int(value)
+
+                  if days <= 0:
+                      return "Never"
+
+                  date_value = (
+                      datetime.date(1970, 1, 1)
+                      + datetime.timedelta(days=days)
+                  )
+
+                  return date_value.isoformat()
+
+              except Exception:
+                  return "Unknown"
+
+          def get_groups(username, primary_gid):
+              groups = []
+
+              try:
+                  primary_group = grp.getgrgid(primary_gid).gr_name
+                  groups.append(primary_group)
+              except Exception:
+                  pass
+
+              for group in grp.getgrall():
+                  if username in group.gr_mem:
+                      if group.gr_name not in groups:
+                          groups.append(group.gr_name)
+
+              return ";".join(groups)
+
+          def get_creation_date(home):
+              if not home or not os.path.exists(home):
+                  return "Unavailable"
+
+              rc, output = run(["stat", "-c", "%w", home])
+
+              if rc != 0:
+                  return "Unavailable"
+
+              if not output or output == "-":
+                  return "Unavailable"
+
+              return output
+
+          def get_sudo(username):
+
+              if not os.path.exists("/usr/bin/sudo"):
+                  return "UNAVAILABLE", "sudo command not installed"
+
+              rc, output = run([
+                  "/usr/bin/sudo",
+                  "-n",
+                  "-l",
+                  "-U",
+                  username
+              ])
+
+              output_lower = output.lower()
+
+              if (
+                  rc == 0
+                  and "not allowed to run sudo" not in output_lower
+                  and "may not run sudo" not in output_lower
+              ):
+                  sudo_access = "YES"
+              else:
+                  sudo_access = "NO"
+
+              if not output:
+                  output = "No sudo privileges detected"
+
+              output = " | ".join(output.splitlines())
+
+              return sudo_access, output[:5000]
+
+          uid_min = get_uid_min()
+          shadow_db = load_shadow()
+
+          today_days = (
+              datetime.date.today()
+              - datetime.date(1970, 1, 1)
+          ).days
+
+          results = []
+
+          for account in pwd.getpwall():
+
+              username = account.pw_name
+              uid = account.pw_uid
+
+              # Filter system/service accounts unless requested.
+              if not INCLUDE_SYSTEM:
+                  if username != "root" and uid < uid_min:
+                      continue
+
+                  if uid == 65534:
+                      continue
+
+              shadow = shadow_db.get(username)
+
+              password_hash = ""
+              last_changed = ""
+              max_age = ""
+              account_expire = ""
+
+              if shadow:
+                  password_hash = shadow[1]
+                  last_changed = shadow[2]
+                  max_age = shadow[4]
+                  account_expire = shadow[7]
+
+              # Password status
+              if password_hash == "":
+                  password_status = "NO-PASSWORD"
+
+              elif password_hash.startswith("!"):
+                  password_status = "LOCKED"
+
+              elif password_hash.startswith("*"):
+                  password_status = "LOCKED"
+
+              else:
+                  password_status = "SET"
+
+              # Password last changed
+              password_last_changed = shadow_day_to_date(
+                  last_changed
+              )
+
+              # Password expiry
+              password_expires = "Never"
+
+              try:
+                  last_change_value = int(last_changed)
+                  max_age_value = int(max_age)
+
+                  if (
+                      last_change_value > 0
+                      and max_age_value > 0
+                      and max_age_value < 99999
+                  ):
+                      expiry_days = (
+                          last_change_value
+                          + max_age_value
+                      )
+
+                      password_expires = shadow_day_to_date(
+                          expiry_days
+                      )
+
+              except Exception:
+                  if max_age:
+                      password_expires = "Unknown"
+
+              # Account expiration
+              if account_expire:
+                  account_expires = shadow_day_to_date(
+                      account_expire
+                  )
+              else:
+                  account_expires = "Never"
+
+              # Account status
+              account_status = "ENABLED"
+
+              try:
+                  if (
+                      account_expire
+                      and int(account_expire) > 0
+                      and int(account_expire) <= today_days
+                  ):
+                      account_status = "EXPIRED"
+
+                  elif account.pw_shell in [
+                      "/sbin/nologin",
+                      "/usr/sbin/nologin",
+                      "/bin/false"
+                  ]:
+                      account_status = "DISABLED-SHELL"
+
+                  elif password_hash.startswith(("!", "*")):
+                      account_status = "PASSWORD-LOCKED"
+
+              except Exception:
+                  pass
+
+              groups = get_groups(
+                  username,
+                  account.pw_gid
+              )
+
+              sudo_access, sudo_privileges = get_sudo(
+                  username
+              )
+
+              creation_date = get_creation_date(
+                  account.pw_dir
+              )
+
+              results.append({
+                  "username": username,
+                  "uid": uid,
+                  "gid": account.pw_gid,
+                  "full_name": account.pw_gecos,
+                  "home_directory": account.pw_dir,
+                  "login_shell": account.pw_shell,
+                  "account_status": account_status,
+                  "password_status": password_status,
+                  "password_last_changed": password_last_changed,
+                  "password_expires": password_expires,
+                  "account_expires": account_expires,
+                  "creation_date_estimate": creation_date,
+                  "groups": groups,
+                  "sudo_access": sudo_access,
+                  "sudo_privileges": sudo_privileges
+              })
+
+          print(json.dumps(results))
+
+    - name: Run Linux account compliance collector
+      ansible.builtin.command:
+        cmd: /usr/bin/python3 /tmp/linux_user_compliance.py
+      register: linux_compliance_raw
+      changed_when: false
+
+    - name: Save compliance information for this host
+      ansible.builtin.set_fact:
+        compliance_accounts: >-
+          {{
+            linux_compliance_raw.stdout
+            | from_json
+          }}
+
+    - name: Display number of accounts collected
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ compliance_accounts | length }}
+          accounts collected
+
+    - name: Remove temporary compliance collector
+      ansible.builtin.file:
+        path: /tmp/linux_user_compliance.py
+        state: absent
+
+
+- name: Generate consolidated Linux compliance report
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    report_file: /tmp/linux-user-compliance.csv
+
+  tasks:
+
+    - name: Generate consolidated CSV report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        mode: "0600"
+        content: |
+          "Server","Server IP","Username","UID","GID","Full Name","Account Status","Password Status","Password Last Changed","Password Expires","Account Expires","Creation Date Estimate","Groups","Sudo Access","Sudo Privileges","Home Directory","Login Shell"
+          {% for host in groups['linux'] | default([]) %}
+          {% for user in hostvars[host].compliance_accounts | default([]) %}
+          "{{ host | replace('"','""') }}","{{ hostvars[host].ansible_host | default(host) | replace('"','""') }}","{{ user.username | replace('"','""') }}","{{ user.uid }}","{{ user.gid }}","{{ user.full_name | replace('"','""') }}","{{ user.account_status }}","{{ user.password_status }}","{{ user.password_last_changed }}","{{ user.password_expires }}","{{ user.account_expires }}","{{ user.creation_date_estimate }}","{{ user.groups | replace('"','""') }}","{{ user.sudo_access }}","{{ user.sudo_privileges | replace('"','""') }}","{{ user.home_directory | replace('"','""') }}","{{ user.login_shell | replace('"','""') }}"
+          {% endfor %}
+          {% endfor %}
+
+    - name: Read consolidated CSV report
+      ansible.builtin.slurp:
+        src: "{{ report_file }}"
+      register: compliance_csv
+
+    - name: Display consolidated report in AWX output
+      ansible.builtin.debug:
+        msg: "{{ compliance_csv.content | b64decode }}"
+
+    - name: Save report into AWX job artifacts
+      ansible.builtin.set_stats:
+        data:
+          linux_user_compliance_csv: >-
+            {{
+              compliance_csv.content
+              | b64decode
+            }}
+        aggregate: false
+        per_host: false
+
+    - name: Display report completion
+      ansible.builtin.debug:
+        msg: >-
+          Consolidated compliance report generated for
+          {{ groups['linux'] | default([]) | length }}
+          Linux servers.
