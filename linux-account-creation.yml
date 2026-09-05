@@ -1,68 +1,25 @@
 ---
-- name: Create Linux user account
-  hosts: linux01
+- name: Create devops Linux user
+  hosts: linux
   become: true
   gather_facts: false
 
-  vars:
-    linux_shell: "/bin/bash"
-    linux_groups: ""
-    linux_sudo: false
-    linux_ssh_public_key: ""
-
-  pre_tasks:
-
-    - name: Validate username
-      ansible.builtin.assert:
-        that:
-          - linux_username | default('') | length > 0
-          - linux_username | default('') is match('^[a-z_][a-z0-9_-]{0,31}$')
-        fail_msg: "linux_username was not provided or is invalid."
-        success_msg: "Username {{ linux_username }} is valid."
-
   tasks:
 
-    - name: Create Linux user
+    - name: Create devops user
       ansible.builtin.user:
-        name: "{{ linux_username }}"
-        comment: "{{ linux_fullname | default(linux_username) }}"
-        shell: "{{ linux_shell | default('/bin/bash') }}"
-        groups: "{{ linux_groups if linux_groups | default('') | length > 0 else omit }}"
-        append: true
+        name: devops
+        comment: "DevOps User"
+        shell: /bin/bash
         create_home: true
         state: present
 
-    - name: Install SSH public key
-      ansible.posix.authorized_key:
-        user: "{{ linux_username }}"
-        key: "{{ linux_ssh_public_key }}"
-        state: present
-        manage_dir: true
-      when:
-        - linux_ssh_public_key | default('') | trim | length > 0
-
-    - name: Configure passwordless sudo
-      ansible.builtin.copy:
-        dest: "/etc/sudoers.d/{{ linux_username }}"
-        content: "{{ linux_username }} ALL=(ALL) NOPASSWD: ALL\n"
-        owner: root
-        group: root
-        mode: "0440"
-        validate: "/usr/sbin/visudo -cf %s"
-      when: linux_sudo | default(false) | bool
-
-    - name: Remove sudo configuration when sudo disabled
-      ansible.builtin.file:
-        path: "/etc/sudoers.d/{{ linux_username }}"
-        state: absent
-      when: not (linux_sudo | default(false) | bool)
-
-    - name: Verify account
+    - name: Verify devops user
       ansible.builtin.command:
-        cmd: "id {{ linux_username }}"
-      register: user_check
+        cmd: id devops
+      register: devops_user
       changed_when: false
 
-    - name: Display account information
+    - name: Display devops account information
       ansible.builtin.debug:
-        var: user_check.stdout
+        var: devops_user.stdout
