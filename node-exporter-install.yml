@@ -1,15 +1,80 @@
 ---
-- name: Install Prometheus Node Exporter on Linux servers
+- name: Install Prometheus Node Exporter from central NFS repository
   hosts: linux
   become: true
   gather_facts: true
 
   vars:
-    node_exporter_source: /opt/awx-packages/node_exporter-linux-amd64.tar.gz
-    node_exporter_remote_archive: /tmp/node_exporter-linux-amd64.tar.gz
-    node_exporter_extract_dir: /tmp/node_exporter_install
+    nfs_server: "192.168.20.204"
+    nfs_export: "/mnt/k8s-nfs-share"
+    nfs_mount: "/mnt/awx-software"
+
+    node_exporter_archive: >-
+      {{ nfs_mount }}/awx-software/node_exporter-linux-amd64.tar.gz
+
+    node_exporter_extract_dir: "/tmp/node_exporter_install"
 
   tasks:
+
+    ###########################################################################
+    # NFS client
+    ###########################################################################
+
+    - name: Install NFS client package
+      ansible.builtin.dnf:
+        name: nfs-utils
+        state: present
+
+    ###########################################################################
+    # Create NFS mount point
+    ###########################################################################
+
+    - name: Create software repository mount directory
+      ansible.builtin.file:
+        path: "{{ nfs_mount }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    ###########################################################################
+    # Mount central software repository
+    ###########################################################################
+
+    - name: Mount central AWX software repository
+      ansible.posix.mount:
+        path: "{{ nfs_mount }}"
+        src: "{{ nfs_server }}:{{ nfs_export }}"
+        fstype: nfs
+        opts: ro
+        state: mounted
+
+    ###########################################################################
+    # Verify package
+    ###########################################################################
+
+    - name: Check Node Exporter archive
+      ansible.builtin.stat:
+        path: "{{ node_exporter_archive }}"
+      register: node_exporter_package
+
+    - name: Fail when Node Exporter package is missing
+      ansible.builtin.fail:
+        msg: >-
+          Node Exporter package was not found:
+          {{ node_exporter_archive }}
+      when: not node_exporter_package.stat.exists
+
+    - name: Display package information
+      ansible.builtin.debug:
+        msg:
+          - "Server: {{ inventory_hostname }}"
+          - "Package: {{ node_exporter_archive }}"
+          - "Package size: {{ node_exporter_package.stat.size | default(0) }} bytes"
+
+    ###########################################################################
+    # Create node_exporter account
+    ###########################################################################
 
     - name: Create Node Exporter account
       ansible.builtin.user:
@@ -19,13 +84,11 @@
         create_home: false
         state: present
 
-    - name: Copy Node Exporter from AWX local repository
-      ansible.builtin.copy:
-        src: "{{ node_exporter_source }}"
-        dest: "{{ node_exporter_remote_archive }}"
-        mode: "0644"
+    ###########################################################################
+    # Prepare temporary extraction directory
+    ###########################################################################
 
-    - name: Remove old extraction directory
+    - name: Remove previous extraction directory
       ansible.builtin.file:
         path: "{{ node_exporter_extract_dir }}"
         state: absent
@@ -34,13 +97,23 @@
       ansible.builtin.file:
         path: "{{ node_exporter_extract_dir }}"
         state: directory
+        owner: root
+        group: root
         mode: "0755"
 
-    - name: Extract Node Exporter
+    ###########################################################################
+    # Extract directly from NFS
+    ###########################################################################
+
+    - name: Extract Node Exporter directly from NFS
       ansible.builtin.unarchive:
-        src: "{{ node_exporter_remote_archive }}"
+        src: "{{ node_exporter_archive }}"
         dest: "{{ node_exporter_extract_dir }}"
         remote_src: true
+
+    ###########################################################################
+    # Locate executable
+    ###########################################################################
 
     - name: Find Node Exporter binary
       ansible.builtin.find:
@@ -50,10 +123,14 @@
         recurse: true
       register: node_exporter_binary
 
-    - name: Fail if Node Exporter binary was not found
+    - name: Fail when Node Exporter binary cannot be found
       ansible.builtin.fail:
-        msg: "node_exporter binary was not found."
-      when: node_exporter_binary.matched == 0
+        msg: "node_exporter binary was not found after extraction."
+      when: node_exporter_binary.matched | int == 0
+
+    ###########################################################################
+    # Install executable
+    ###########################################################################
 
     - name: Install Node Exporter binary
       ansible.builtin.copy:
@@ -64,7 +141,25 @@
         group: root
         mode: "0755"
 
-    - name: Create Node Exporter service
+    ###########################################################################
+    # Verify executable
+    ###########################################################################
+
+    - name: Check Node Exporter version
+      ansible.builtin.command:
+        cmd: /usr/local/bin/node_exporter --version
+      register: node_exporter_version
+      changed_when: false
+
+    - name: Display Node Exporter version
+      ansible.builtin.debug:
+        var: node_exporter_version.stdout_lines
+
+    ###########################################################################
+    # systemd
+    ###########################################################################
+
+    - name: Create Node Exporter systemd service
       ansible.builtin.copy:
         dest: /etc/systemd/system/node_exporter.service
         owner: root
@@ -73,6 +168,7 @@
         content: |
           [Unit]
           Description=Prometheus Node Exporter
+          Documentation=https://prometheus.io/docs/guides/node-exporter/
           Wants=network-online.target
           After=network-online.target
 
@@ -80,7 +176,10 @@
           User=node_exporter
           Group=node_exporter
           Type=simple
-          ExecStart=/usr/local/bin/node_exporter
+
+          ExecStart=/usr/local/bin/node_exporter \
+            --web.listen-address=0.0.0.0:9100
+
           Restart=on-failure
           RestartSec=5
 
@@ -91,52 +190,76 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
-    - name: Start Node Exporter
+    - name: Enable and restart Node Exporter
       ansible.builtin.systemd:
         name: node_exporter
         enabled: true
         state: restarted
 
-    - name: Check firewalld
+    ###########################################################################
+    # Firewall
+    ###########################################################################
+
+    - name: Check firewalld service
       ansible.builtin.command:
         cmd: systemctl is-active firewalld
       register: firewalld_status
-      failed_when: false
       changed_when: false
+      failed_when: false
 
-    - name: Open TCP 9100
+    - name: Open Node Exporter TCP port 9100
       ansible.builtin.command:
         cmd: firewall-cmd --permanent --add-port=9100/tcp
+      register: firewall_9100
+      changed_when: "'success' in firewall_9100.stdout"
       when: firewalld_status.rc == 0
-      changed_when: false
 
     - name: Reload firewalld
       ansible.builtin.command:
         cmd: firewall-cmd --reload
-      when: firewalld_status.rc == 0
       changed_when: false
+      when: firewalld_status.rc == 0
 
-    - name: Verify Node Exporter
+    ###########################################################################
+    # Verify service
+    ###########################################################################
+
+    - name: Wait for Node Exporter
       ansible.builtin.uri:
         url: http://127.0.0.1:9100/metrics
+        method: GET
         status_code: 200
-      register: exporter_test
-      retries: 5
+      register: node_exporter_health
+      retries: 10
       delay: 2
-      until: exporter_test.status == 200
+      until: node_exporter_health.status == 200
 
-    - name: Display result
+    - name: Check Node Exporter systemd status
+      ansible.builtin.command:
+        cmd: systemctl is-active node_exporter
+      register: node_exporter_service
+      changed_when: false
+
+    ###########################################################################
+    # Results
+    ###########################################################################
+
+    - name: Display installation result
       ansible.builtin.debug:
         msg:
-          - "Host: {{ inventory_hostname }}"
-          - "IP: {{ ansible_host }}"
-          - "Node Exporter: Running"
-          - "URL: http://{{ ansible_host }}:9100/metrics"
+          - "=============================================="
+          - "Server: {{ inventory_hostname }}"
+          - "IP: {{ ansible_host | default(inventory_hostname) }}"
+          - "Node Exporter service: {{ node_exporter_service.stdout }}"
+          - "Metrics URL: http://{{ ansible_host | default(inventory_hostname) }}:9100/metrics"
+          - "Source repository: {{ nfs_server }}:{{ nfs_export }}"
+          - "=============================================="
 
-    - name: Clean temporary files
+    ###########################################################################
+    # Cleanup temporary extraction directory
+    ###########################################################################
+
+    - name: Remove temporary extraction directory
       ansible.builtin.file:
-        path: "{{ item }}"
+        path: "{{ node_exporter_extract_dir }}"
         state: absent
-      loop:
-        - "{{ node_exporter_remote_archive }}"
-        - "{{ node_exporter_extract_dir }}"
