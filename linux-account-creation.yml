@@ -1,6 +1,6 @@
 ---
 - name: Create devops Linux user
-  hosts: linux01
+  hosts: linux
   become: true
   gather_facts: false
 
@@ -13,6 +13,15 @@
         shell: /bin/bash
         create_home: true
         state: present
+
+    - name: Give devops sudo access
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/devops
+        content: "devops ALL=(ALL) NOPASSWD: ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "/usr/sbin/visudo -cf %s"
 
     - name: Verify devops user
       ansible.builtin.command:
