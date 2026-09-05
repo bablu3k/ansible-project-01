@@ -1,0 +1,175 @@
+---
+- name: Install Prometheus
+  hosts: monitoring
+  become: true
+  gather_facts: true
+
+  vars:
+    prometheus_version: "3.14.0"
+    prometheus_source: /opt/awx-packages/prometheus-3.14.0.linux-amd64.tar.gz
+    prometheus_archive: /tmp/prometheus.tar.gz
+    prometheus_extract: /tmp/prometheus_install
+
+  tasks:
+
+    - name: Create Prometheus service account
+      ansible.builtin.user:
+        name: prometheus
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+
+    - name: Create Prometheus directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: "0755"
+      loop:
+        - /etc/prometheus
+        - /var/lib/prometheus
+
+    - name: Copy Prometheus from AWX local repository
+      ansible.builtin.copy:
+        src: "{{ prometheus_source }}"
+        dest: "{{ prometheus_archive }}"
+        mode: "0644"
+
+    - name: Remove old extraction directory
+      ansible.builtin.file:
+        path: "{{ prometheus_extract }}"
+        state: absent
+
+    - name: Create extraction directory
+      ansible.builtin.file:
+        path: "{{ prometheus_extract }}"
+        state: directory
+        mode: "0755"
+
+    - name: Extract Prometheus
+      ansible.builtin.unarchive:
+        src: "{{ prometheus_archive }}"
+        dest: "{{ prometheus_extract }}"
+        remote_src: true
+
+    - name: Install Prometheus binary
+      ansible.builtin.copy:
+        src: "{{ prometheus_extract }}/prometheus-{{ prometheus_version }}.linux-amd64/prometheus"
+        dest: /usr/local/bin/prometheus
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install promtool
+      ansible.builtin.copy:
+        src: "{{ prometheus_extract }}/prometheus-{{ prometheus_version }}.linux-amd64/promtool"
+        dest: /usr/local/bin/promtool
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Generate Prometheus configuration from AWX inventory
+      ansible.builtin.copy:
+        dest: /etc/prometheus/prometheus.yml
+        owner: prometheus
+        group: prometheus
+        mode: "0644"
+        content: |
+          global:
+            scrape_interval: 15s
+            evaluation_interval: 15s
+
+          scrape_configs:
+
+            - job_name: "prometheus"
+              static_configs:
+                - targets:
+                    - "127.0.0.1:9090"
+
+            - job_name: "linux-servers"
+              static_configs:
+          {% for host in groups['linux'] | default([]) %}
+                - targets:
+                    - "{{ hostvars[host].ansible_host | default(host) }}:9100"
+                  labels:
+                    server: "{{ host }}"
+          {% endfor %}
+
+    - name: Validate Prometheus configuration
+      ansible.builtin.command:
+        cmd: /usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+      changed_when: false
+
+    - name: Create Prometheus systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/prometheus.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Prometheus Monitoring
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=prometheus
+          Group=prometheus
+          Type=simple
+
+          ExecStart=/usr/local/bin/prometheus \
+            --config.file=/etc/prometheus/prometheus.yml \
+            --storage.tsdb.path=/var/lib/prometheus \
+            --web.listen-address=0.0.0.0:9090
+
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Start Prometheus
+      ansible.builtin.systemd:
+        name: prometheus
+        enabled: true
+        state: restarted
+
+    - name: Open Prometheus firewall port
+      ansible.builtin.command:
+        cmd: firewall-cmd --permanent --add-port=9090/tcp
+      failed_when: false
+      changed_when: false
+
+    - name: Reload firewalld
+      ansible.builtin.command:
+        cmd: firewall-cmd --reload
+      failed_when: false
+      changed_when: false
+
+    - name: Wait for Prometheus
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9090/-/ready
+        status_code: 200
+      register: prometheus_health
+      retries: 15
+      delay: 3
+      until: prometheus_health.status == 200
+
+    - name: Display Prometheus URL
+      ansible.builtin.debug:
+        msg: "Prometheus: http://{{ ansible_host }}:9090"
+
+    - name: Clean temporary files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ prometheus_archive }}"
+        - "{{ prometheus_extract }}"
