@@ -1,0 +1,4 @@
+---
+- import_playbook: node-exporter-install.yml
+- import_playbook: prometheus-install.yml
+- import_playbook: grafana-install.yml
