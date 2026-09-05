@@ -5,8 +5,6 @@
   gather_facts: true
 
   vars:
-    # false = root + normal human users based on UID_MIN
-    # true  = include service/system accounts too
     include_system_accounts: false
 
   tasks:
@@ -27,7 +25,7 @@
           import pwd
           import subprocess
 
-          INCLUDE_SYSTEM = {{ include_system_accounts | bool | lower }}
+          INCLUDE_SYSTEM = {{ include_system_accounts | bool | ternary('True', 'False') }}
 
           def run(command):
               try:
@@ -83,13 +81,10 @@
                   if days <= 0:
                       return "Never"
 
-                  date_value = (
+                  return str(
                       datetime.date(1970, 1, 1)
                       + datetime.timedelta(days=days)
                   )
-
-                  return date_value.isoformat()
-
               except Exception:
                   return "Unknown"
 
@@ -115,19 +110,12 @@
 
               rc, output = run(["stat", "-c", "%w", home])
 
-              if rc != 0:
-                  return "Unavailable"
-
-              if not output or output == "-":
+              if rc != 0 or not output or output == "-":
                   return "Unavailable"
 
               return output
 
           def get_sudo(username):
-
-              if not os.path.exists("/usr/bin/sudo"):
-                  return "UNAVAILABLE", "sudo command not installed"
-
               rc, output = run([
                   "/usr/bin/sudo",
                   "-n",
@@ -169,7 +157,6 @@
               username = account.pw_name
               uid = account.pw_uid
 
-              # Filter system/service accounts unless requested.
               if not INCLUDE_SYSTEM:
                   if username != "root" and uid < uid_min:
                       continue
@@ -190,25 +177,17 @@
                   max_age = shadow[4]
                   account_expire = shadow[7]
 
-              # Password status
               if password_hash == "":
                   password_status = "NO-PASSWORD"
-
-              elif password_hash.startswith("!"):
+              elif password_hash.startswith(("!", "*")):
                   password_status = "LOCKED"
-
-              elif password_hash.startswith("*"):
-                  password_status = "LOCKED"
-
               else:
                   password_status = "SET"
 
-              # Password last changed
               password_last_changed = shadow_day_to_date(
                   last_changed
               )
 
-              # Password expiry
               password_expires = "Never"
 
               try:
@@ -220,20 +199,12 @@
                       and max_age_value > 0
                       and max_age_value < 99999
                   ):
-                      expiry_days = (
-                          last_change_value
-                          + max_age_value
-                      )
-
                       password_expires = shadow_day_to_date(
-                          expiry_days
+                          last_change_value + max_age_value
                       )
-
               except Exception:
-                  if max_age:
-                      password_expires = "Unknown"
+                  pass
 
-              # Account expiration
               if account_expire:
                   account_expires = shadow_day_to_date(
                       account_expire
@@ -241,7 +212,6 @@
               else:
                   account_expires = "Never"
 
-              # Account status
               account_status = "ENABLED"
 
               try:
@@ -304,71 +274,18 @@
       register: linux_compliance_raw
       changed_when: false
 
-    - name: Save compliance information for this host
+    - name: Save compliance data
       ansible.builtin.set_fact:
-        compliance_accounts: >-
-          {{
-            linux_compliance_raw.stdout
-            | from_json
-          }}
+        compliance_accounts: "{{ linux_compliance_raw.stdout | from_json }}"
 
-    - name: Display number of accounts collected
+    - name: Show number of accounts collected
       ansible.builtin.debug:
         msg: >-
           {{ inventory_hostname }}:
           {{ compliance_accounts | length }}
-          accounts collected
+          user accounts collected
 
-    - name: Remove temporary compliance collector
+    - name: Remove temporary collector
       ansible.builtin.file:
         path: /tmp/linux_user_compliance.py
         state: absent
-
-
-- name: Generate consolidated Linux compliance report
-  hosts: localhost
-  gather_facts: false
-
-  vars:
-    report_file: /tmp/linux-user-compliance.csv
-
-  tasks:
-
-    - name: Generate consolidated CSV report
-      ansible.builtin.copy:
-        dest: "{{ report_file }}"
-        mode: "0600"
-        content: |
-          "Server","Server IP","Username","UID","GID","Full Name","Account Status","Password Status","Password Last Changed","Password Expires","Account Expires","Creation Date Estimate","Groups","Sudo Access","Sudo Privileges","Home Directory","Login Shell"
-          {% for host in groups['linux'] | default([]) %}
-          {% for user in hostvars[host].compliance_accounts | default([]) %}
-          "{{ host | replace('"','""') }}","{{ hostvars[host].ansible_host | default(host) | replace('"','""') }}","{{ user.username | replace('"','""') }}","{{ user.uid }}","{{ user.gid }}","{{ user.full_name | replace('"','""') }}","{{ user.account_status }}","{{ user.password_status }}","{{ user.password_last_changed }}","{{ user.password_expires }}","{{ user.account_expires }}","{{ user.creation_date_estimate }}","{{ user.groups | replace('"','""') }}","{{ user.sudo_access }}","{{ user.sudo_privileges | replace('"','""') }}","{{ user.home_directory | replace('"','""') }}","{{ user.login_shell | replace('"','""') }}"
-          {% endfor %}
-          {% endfor %}
-
-    - name: Read consolidated CSV report
-      ansible.builtin.slurp:
-        src: "{{ report_file }}"
-      register: compliance_csv
-
-    - name: Display consolidated report in AWX output
-      ansible.builtin.debug:
-        msg: "{{ compliance_csv.content | b64decode }}"
-
-    - name: Save report into AWX job artifacts
-      ansible.builtin.set_stats:
-        data:
-          linux_user_compliance_csv: >-
-            {{
-              compliance_csv.content
-              | b64decode
-            }}
-        aggregate: false
-        per_host: false
-
-    - name: Display report completion
-      ansible.builtin.debug:
-        msg: >-
-          Consolidated compliance report generated for
-          {{ groups['linux'] | default([]) | length }}
-          Linux servers.
