@@ -1,0 +1,80 @@
+---
+- name: Install Grafana
+  hosts: monitoring
+  become: true
+  gather_facts: true
+
+  vars:
+    grafana_source: /opt/awx-packages/grafana_13.2.1_33191028959_linux_amd64.rpm
+    grafana_rpm: /tmp/grafana.rpm
+
+  tasks:
+
+    - name: Copy Grafana RPM from AWX local repository
+      ansible.builtin.copy:
+        src: "{{ grafana_source }}"
+        dest: "{{ grafana_rpm }}"
+        mode: "0644"
+
+    - name: Install Grafana RPM
+      ansible.builtin.dnf:
+        name: "{{ grafana_rpm }}"
+        state: present
+        disable_gpg_check: true
+
+    - name: Configure Prometheus datasource
+      ansible.builtin.copy:
+        dest: /etc/grafana/provisioning/datasources/prometheus.yml
+        owner: root
+        group: grafana
+        mode: "0640"
+        content: |
+          apiVersion: 1
+
+          datasources:
+            - name: Prometheus
+              uid: prometheus
+              type: prometheus
+              access: proxy
+              url: http://127.0.0.1:9090
+              isDefault: true
+              editable: true
+
+    - name: Start Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        enabled: true
+        state: restarted
+        daemon_reload: true
+
+    - name: Open Grafana firewall port
+      ansible.builtin.command:
+        cmd: firewall-cmd --permanent --add-port=3000/tcp
+      failed_when: false
+      changed_when: false
+
+    - name: Reload firewalld
+      ansible.builtin.command:
+        cmd: firewall-cmd --reload
+      failed_when: false
+      changed_when: false
+
+    - name: Wait for Grafana
+      ansible.builtin.uri:
+        url: http://127.0.0.1:3000/api/health
+        status_code: 200
+      register: grafana_health
+      retries: 15
+      delay: 3
+      until: grafana_health.status == 200
+
+    - name: Display Grafana information
+      ansible.builtin.debug:
+        msg:
+          - "Grafana: http://{{ ansible_host }}:3000"
+          - "Prometheus: http://{{ ansible_host }}:9090"
+
+    - name: Remove temporary RPM
+      ansible.builtin.file:
+        path: "{{ grafana_rpm }}"
+        state: absent
