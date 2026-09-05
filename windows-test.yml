@@ -1,0 +1,16 @@
+---
+- name: Test Windows managed nodes
+  hosts: windows
+  gather_facts: true
+
+  tasks:
+
+    - name: Test Windows connectivity
+      ansible.windows.win_ping:
+
+    - name: Display Windows information
+      ansible.builtin.debug:
+        msg: >
+          Host={{ inventory_hostname }}
+          OS={{ ansible_distribution }}
+          Version={{ ansible_distribution_version }}

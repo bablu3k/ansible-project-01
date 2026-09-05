@@ -1,0 +1,17 @@
+---
+- name: Test Linux managed nodes
+  hosts: linux01
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    - name: Ansible connectivity test
+      ansible.builtin.ping:
+
+    - name: Display operating system
+      ansible.builtin.debug:
+        msg: >
+          Host={{ inventory_hostname }}
+          OS={{ ansible_distribution }}
+          Version={{ ansible_distribution_version }}
