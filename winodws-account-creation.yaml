@@ -1,6 +1,6 @@
 ---
 - name: Create DevOps local account on Windows
-  hosts: windows
+  hosts: win01
   gather_facts: false
 
   tasks:
