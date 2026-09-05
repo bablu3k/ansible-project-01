@@ -1,55 +1,61 @@
 ---
-- name: Install Prometheus Node Exporter on all Linux servers
+- name: Install Prometheus Node Exporter on Linux servers
   hosts: linux
   become: true
   gather_facts: true
 
   vars:
-    node_exporter_user: node_exporter
-    node_exporter_port: 9100
-    node_exporter_tmp: /tmp/node_exporter.tar.gz
+    node_exporter_source: /opt/awx-packages/node_exporter-linux-amd64.tar.gz
+    node_exporter_remote_archive: /tmp/node_exporter-linux-amd64.tar.gz
+    node_exporter_extract_dir: /tmp/node_exporter_install
 
   tasks:
 
-    - name: Create node_exporter service account
+    - name: Create Node Exporter account
       ansible.builtin.user:
-        name: "{{ node_exporter_user }}"
+        name: node_exporter
         system: true
         shell: /sbin/nologin
         create_home: false
+        state: present
 
-    - name: Copy node_exporter package
+    - name: Copy Node Exporter from AWX local repository
       ansible.builtin.copy:
-        src: files/node_exporter-linux-amd64.tar.gz
-        dest: "{{ node_exporter_tmp }}"
+        src: "{{ node_exporter_source }}"
+        dest: "{{ node_exporter_remote_archive }}"
         mode: "0644"
 
-    - name: Create temporary extraction directory
+    - name: Remove old extraction directory
       ansible.builtin.file:
-        path: /tmp/node_exporter_extract
+        path: "{{ node_exporter_extract_dir }}"
+        state: absent
+
+    - name: Create extraction directory
+      ansible.builtin.file:
+        path: "{{ node_exporter_extract_dir }}"
         state: directory
         mode: "0755"
 
-    - name: Extract node_exporter
+    - name: Extract Node Exporter
       ansible.builtin.unarchive:
-        src: "{{ node_exporter_tmp }}"
-        dest: /tmp/node_exporter_extract
+        src: "{{ node_exporter_remote_archive }}"
+        dest: "{{ node_exporter_extract_dir }}"
         remote_src: true
 
-    - name: Locate node_exporter binary
+    - name: Find Node Exporter binary
       ansible.builtin.find:
-        paths: /tmp/node_exporter_extract
+        paths: "{{ node_exporter_extract_dir }}"
         patterns: node_exporter
         file_type: file
         recurse: true
       register: node_exporter_binary
 
-    - name: Fail when node_exporter binary cannot be found
+    - name: Fail if Node Exporter binary was not found
       ansible.builtin.fail:
-        msg: "node_exporter binary was not found in archive"
+        msg: "node_exporter binary was not found."
       when: node_exporter_binary.matched == 0
 
-    - name: Install node_exporter binary
+    - name: Install Node Exporter binary
       ansible.builtin.copy:
         src: "{{ node_exporter_binary.files[0].path }}"
         dest: /usr/local/bin/node_exporter
@@ -58,7 +64,7 @@
         group: root
         mode: "0755"
 
-    - name: Create node_exporter systemd service
+    - name: Create Node Exporter service
       ansible.builtin.copy:
         dest: /etc/systemd/system/node_exporter.service
         owner: root
@@ -71,11 +77,11 @@
           After=network-online.target
 
           [Service]
-          User={{ node_exporter_user }}
-          Group={{ node_exporter_user }}
+          User=node_exporter
+          Group=node_exporter
           Type=simple
           ExecStart=/usr/local/bin/node_exporter
-          Restart=always
+          Restart=on-failure
           RestartSec=5
 
           [Install]
@@ -85,40 +91,52 @@
       ansible.builtin.systemd:
         daemon_reload: true
 
-    - name: Enable and start node_exporter
+    - name: Start Node Exporter
       ansible.builtin.systemd:
         name: node_exporter
         enabled: true
-        state: started
+        state: restarted
 
-    - name: Open node_exporter firewall port
-      ansible.posix.firewalld:
-        port: "{{ node_exporter_port }}/tcp"
-        permanent: true
-        immediate: true
-        state: enabled
-      when:
-        - ansible_facts.services is not defined or true
+    - name: Check firewalld
+      ansible.builtin.command:
+        cmd: systemctl is-active firewalld
+      register: firewalld_status
+      failed_when: false
+      changed_when: false
 
-    - name: Test node_exporter locally
+    - name: Open TCP 9100
+      ansible.builtin.command:
+        cmd: firewall-cmd --permanent --add-port=9100/tcp
+      when: firewalld_status.rc == 0
+      changed_when: false
+
+    - name: Reload firewalld
+      ansible.builtin.command:
+        cmd: firewall-cmd --reload
+      when: firewalld_status.rc == 0
+      changed_when: false
+
+    - name: Verify Node Exporter
       ansible.builtin.uri:
-        url: "http://127.0.0.1:{{ node_exporter_port }}/metrics"
-        method: GET
+        url: http://127.0.0.1:9100/metrics
         status_code: 200
       register: exporter_test
+      retries: 5
+      delay: 2
+      until: exporter_test.status == 200
 
-    - name: Display installation result
+    - name: Display result
       ansible.builtin.debug:
         msg:
-          - "Server: {{ inventory_hostname }}"
-          - "IP: {{ ansible_host | default(inventory_hostname) }}"
-          - "Node Exporter: RUNNING"
-          - "Metrics URL: http://{{ ansible_host | default(inventory_hostname) }}:{{ node_exporter_port }}/metrics"
+          - "Host: {{ inventory_hostname }}"
+          - "IP: {{ ansible_host }}"
+          - "Node Exporter: Running"
+          - "URL: http://{{ ansible_host }}:9100/metrics"
 
     - name: Clean temporary files
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
-        - /tmp/node_exporter.tar.gz
-        - /tmp/node_exporter_extract
+        - "{{ node_exporter_remote_archive }}"
+        - "{{ node_exporter_extract_dir }}"
