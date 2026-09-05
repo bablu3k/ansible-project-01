@@ -1,27 +1,22 @@
 ---
+###############################################################################
+# PLAY 1
+# Collect Linux account information from all Linux managed nodes
+###############################################################################
+
 - name: Collect Linux user account compliance
   hosts: linux
   become: true
   gather_facts: true
 
   vars:
-    report_dir: /tmp/linux-user-compliance
-
-    # false = root + normal human users only
-    # true  = include system/service accounts
+    # false = root + normal human users
+    # true  = include system/service users also
     include_system_accounts: false
 
   tasks:
 
-    - name: Create compliance report directory
-      ansible.builtin.file:
-        path: "{{ report_dir }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Install temporary Linux compliance collector
+    - name: Install temporary compliance collector
       ansible.builtin.copy:
         dest: /tmp/linux_user_compliance.py
         owner: root
@@ -30,21 +25,16 @@
         content: |
           #!/usr/bin/python3
 
-          import csv
           import datetime
           import grp
+          import json
           import os
           import pwd
-          import socket
           import subprocess
 
           INCLUDE_SYSTEM = {{ include_system_accounts | bool | ternary('True', 'False') }}
 
-          REPORT_DIR = "{{ report_dir }}"
-          INVENTORY_HOST = "{{ inventory_hostname }}"
-          SERVER_IP = "{{ ansible_host | default(ansible_default_ipv4.address | default(inventory_hostname)) }}"
-
-          def run(command):
+          def run_command(command):
               try:
                   result = subprocess.run(
                       command,
@@ -61,18 +51,14 @@
 
 
           def get_uid_min():
-
               uid_min = 1000
 
               try:
                   with open("/etc/login.defs", "r") as file:
-
                       for line in file:
-
                           line = line.strip()
 
                           if line.startswith("UID_MIN"):
-
                               parts = line.split()
 
                               if len(parts) >= 2:
@@ -85,15 +71,12 @@
               return uid_min
 
 
-          def load_shadow():
-
+          def load_local_shadow():
               shadow = {}
 
               try:
                   with open("/etc/shadow", "r") as file:
-
                       for line in file:
-
                           fields = line.rstrip("\n").split(":")
 
                           if len(fields) >= 9:
@@ -105,32 +88,28 @@
               return shadow
 
 
-          def shadow_day_to_date(value):
-
+          def day_number_to_date(value):
               try:
-
                   days = int(value)
 
                   if days <= 0:
                       return "Never"
 
-                  result = (
+                  date_value = (
                       datetime.date(1970, 1, 1)
                       + datetime.timedelta(days=days)
                   )
 
-                  return result.isoformat()
+                  return date_value.isoformat()
 
               except Exception:
                   return "Unknown"
 
 
-          def get_groups(username, primary_gid):
-
+          def get_user_groups(username, primary_gid):
               groups = []
 
               try:
-
                   primary_group = grp.getgrgid(primary_gid).gr_name
 
                   groups.append(primary_group)
@@ -138,17 +117,27 @@
               except Exception:
                   pass
 
-              for group in grp.getgrall():
+              try:
+                  rc, output = run_command(
+                      ["id", "-nG", username]
+                  )
 
-                  if username in group.gr_mem:
+                  if rc == 0:
+                      for group_name in output.split():
+                          if group_name not in groups:
+                              groups.append(group_name)
 
-                      if group.gr_name not in groups:
-                          groups.append(group.gr_name)
+              except Exception:
+                  pass
 
               return ";".join(groups)
 
 
           def get_creation_date(home_directory):
+              """
+              Linux does not provide a universally reliable user creation date.
+              This uses filesystem birth time of the home directory as an estimate.
+              """
 
               if not home_directory:
                   return "Unavailable"
@@ -156,7 +145,7 @@
               if not os.path.exists(home_directory):
                   return "Unavailable"
 
-              rc, output = run(
+              rc, output = run_command(
                   [
                       "stat",
                       "-c",
@@ -177,18 +166,16 @@
               return output
 
 
-          def get_sudo(username):
-
+          def get_sudo_information(username):
               sudo_binary = "/usr/bin/sudo"
 
               if not os.path.exists(sudo_binary):
-
                   return (
                       "UNAVAILABLE",
                       "sudo command is not installed"
                   )
 
-              rc, output = run(
+              rc, output = run_command(
                   [
                       sudo_binary,
                       "-n",
@@ -200,15 +187,15 @@
 
               output_lower = output.lower()
 
-              denied_strings = [
+              deny_messages = [
                   "not allowed to run sudo",
                   "may not run sudo",
                   "is not in the sudoers file"
               ]
 
               denied = any(
-                  item in output_lower
-                  for item in denied_strings
+                  message in output_lower
+                  for message in deny_messages
               )
 
               if rc == 0 and not denied:
@@ -219,6 +206,7 @@
               if not output:
                   output = "No sudo privileges detected"
 
+              # Remove newlines because output will go into a CSV row.
               output = " | ".join(
                   output.splitlines()
               )
@@ -228,26 +216,28 @@
 
           uid_min = get_uid_min()
 
-          shadow_db = load_shadow()
+          shadow_db = load_local_shadow()
 
-          today_days = (
+          today_number = (
               datetime.date.today()
               - datetime.date(1970, 1, 1)
           ).days
 
-          records = []
+          compliance_records = []
+
+          #####################################################################
+          # Read accounts
+          #####################################################################
 
           for account in pwd.getpwall():
 
               username = account.pw_name
-
               uid = account.pw_uid
-
               gid = account.pw_gid
 
-              # -------------------------------------------------
-              # Filter system accounts
-              # -------------------------------------------------
+              #################################################################
+              # Exclude system/service users by default
+              #################################################################
 
               if not INCLUDE_SYSTEM:
 
@@ -260,110 +250,90 @@
               shadow = shadow_db.get(username)
 
               password_hash = ""
-
               last_changed = ""
-
               min_age = ""
-
               max_age = ""
-
               warning_days = ""
-
               inactive_days = ""
-
               account_expire = ""
 
               if shadow:
 
                   password_hash = shadow[1]
-
                   last_changed = shadow[2]
-
                   min_age = shadow[3]
-
                   max_age = shadow[4]
-
                   warning_days = shadow[5]
-
                   inactive_days = shadow[6]
-
                   account_expire = shadow[7]
 
-              # -------------------------------------------------
-              # Password status
-              # -------------------------------------------------
+              #################################################################
+              # Password Status
+              #################################################################
 
               if password_hash == "":
-
                   password_status = "NO-PASSWORD"
 
               elif password_hash.startswith("!"):
-
                   password_status = "LOCKED"
 
               elif password_hash.startswith("*"):
-
                   password_status = "LOCKED"
 
               else:
-
                   password_status = "SET"
 
-              # -------------------------------------------------
-              # Password last changed
-              # -------------------------------------------------
+              #################################################################
+              # Password Last Changed
+              #################################################################
 
-              password_last_changed = shadow_day_to_date(
+              password_last_changed = day_number_to_date(
                   last_changed
               )
 
-              # -------------------------------------------------
-              # Password expiration
-              # -------------------------------------------------
+              #################################################################
+              # Password Expiration
+              #################################################################
 
               password_expires = "Never"
 
               try:
-
-                  last_change_value = int(last_changed)
-
-                  maximum_age_value = int(max_age)
+                  last_changed_int = int(last_changed)
+                  max_age_int = int(max_age)
 
                   if (
-                      last_change_value > 0
-                      and maximum_age_value > 0
-                      and maximum_age_value < 99999
+                      last_changed_int > 0
+                      and max_age_int > 0
+                      and max_age_int < 99999
                   ):
 
-                      expiry_day = (
-                          last_change_value
-                          + maximum_age_value
+                      password_expiry_day = (
+                          last_changed_int + max_age_int
                       )
 
-                      password_expires = shadow_day_to_date(
-                          expiry_day
+                      password_expires = day_number_to_date(
+                          password_expiry_day
                       )
 
               except Exception:
                   pass
 
-              # -------------------------------------------------
-              # Account expiration
-              # -------------------------------------------------
+              #################################################################
+              # Account Expiration
+              #################################################################
 
               if account_expire:
 
-                  account_expires = shadow_day_to_date(
+                  account_expires = day_number_to_date(
                       account_expire
                   )
 
               else:
-
                   account_expires = "Never"
 
-              # -------------------------------------------------
-              # Account status
-              # -------------------------------------------------
+              #################################################################
+              # Account Status
+              #################################################################
 
               account_status = "ENABLED"
 
@@ -372,7 +342,7 @@
                   if (
                       account_expire
                       and int(account_expire) > 0
-                      and int(account_expire) <= today_days
+                      and int(account_expire) <= today_number
                   ):
 
                       account_status = "EXPIRED"
@@ -392,35 +362,37 @@
               except Exception:
                   pass
 
-              # -------------------------------------------------
-              # Groups
-              # -------------------------------------------------
+              #################################################################
+              # Group Membership
+              #################################################################
 
-              groups = get_groups(
+              user_groups = get_user_groups(
                   username,
                   gid
               )
 
-              # -------------------------------------------------
-              # Sudo
-              # -------------------------------------------------
+              #################################################################
+              # Sudo Privileges
+              #################################################################
 
-              sudo_access, sudo_privileges = get_sudo(
-                  username
+              sudo_access, sudo_privileges = (
+                  get_sudo_information(username)
               )
 
-              # -------------------------------------------------
-              # Creation date
-              # -------------------------------------------------
+              #################################################################
+              # User Creation Date Estimate
+              #################################################################
 
               creation_date = get_creation_date(
                   account.pw_dir
               )
 
-              records.append(
+              #################################################################
+              # Result
+              #################################################################
+
+              compliance_records.append(
                   {
-                      "server": INVENTORY_HOST,
-                      "server_ip": SERVER_IP,
                       "username": username,
                       "uid": uid,
                       "gid": gid,
@@ -435,7 +407,7 @@
                       "password_inactive_days": inactive_days,
                       "account_expires": account_expires,
                       "creation_date_estimate": creation_date,
-                      "groups": groups,
+                      "groups": user_groups,
                       "sudo_access": sudo_access,
                       "sudo_privileges": sudo_privileges,
                       "home_directory": account.pw_dir,
@@ -443,219 +415,154 @@
                   }
               )
 
-          os.makedirs(
-              REPORT_DIR,
-              exist_ok=True
-          )
-
-          report_file = os.path.join(
-              REPORT_DIR,
-              INVENTORY_HOST + "-user-compliance.csv"
-          )
-
-          fields = [
-              "server",
-              "server_ip",
-              "username",
-              "uid",
-              "gid",
-              "full_name",
-              "account_status",
-              "password_status",
-              "password_last_changed",
-              "password_expires",
-              "password_min_days",
-              "password_max_days",
-              "password_warning_days",
-              "password_inactive_days",
-              "account_expires",
-              "creation_date_estimate",
-              "groups",
-              "sudo_access",
-              "sudo_privileges",
-              "home_directory",
-              "login_shell"
-          ]
-
-          with open(
-              report_file,
-              "w",
-              newline=""
-          ) as csv_file:
-
-              writer = csv.DictWriter(
-                  csv_file,
-                  fieldnames=fields,
-                  quoting=csv.QUOTE_ALL
+          print(
+              json.dumps(
+                  compliance_records
               )
-
-              writer.writeheader()
-
-              writer.writerows(records)
-
-          print(
-              "REPORT_FILE=" + report_file
-          )
-
-          print(
-              "ACCOUNTS_CHECKED=" + str(len(records))
           )
 
 
-    - name: Run Linux account compliance collector
+    - name: Execute Linux compliance collector
       ansible.builtin.command:
         cmd: /usr/bin/python3 /tmp/linux_user_compliance.py
-      register: compliance_result
+      register: compliance_raw
       changed_when: false
 
 
-    - name: Display compliance report information
+    - name: Store compliance results for central report
+      ansible.builtin.set_fact:
+        compliance_accounts: >-
+          {{
+            compliance_raw.stdout
+            | from_json
+          }}
+
+
+    - name: Display collection summary
       ansible.builtin.debug:
         msg:
           - "Server: {{ inventory_hostname }}"
-          - "IP: {{ ansible_host | default(inventory_hostname) }}"
-          - "{{ compliance_result.stdout }}"
+          - "IP Address: {{ ansible_host | default(inventory_hostname) }}"
+          - "Accounts collected: {{ compliance_accounts | length }}"
 
 
-    - name: Check generated CSV report
-      ansible.builtin.stat:
-        path: "{{ report_dir }}/{{ inventory_hostname }}-user-compliance.csv"
-      register: report_status
-
-
-    - name: Show generated CSV file
-      ansible.builtin.debug:
-        msg: >-
-          CSV report created:
-          {{ report_dir }}/{{ inventory_hostname }}-user-compliance.csv
-          Size={{ report_status.stat.size | default(0) }} bytes
-
-
-    - name: Fetch CSV report from managed server to AWX job
-      ansible.builtin.fetch:
-        src: "{{ report_dir }}/{{ inventory_hostname }}-user-compliance.csv"
-        dest: "/tmp/linux-user-compliance/{{ inventory_hostname }}-user-compliance.csv"
-        flat: true
-
-
-    - name: Remove temporary Python collector
+    - name: Remove temporary compliance script
       ansible.builtin.file:
         path: /tmp/linux_user_compliance.py
         state: absent
 
 
-# =====================================================================
-# Consolidate all server CSV reports into a single CSV on AWX
-# =====================================================================
+###############################################################################
+# PLAY 2
+# Create ONE consolidated report centrally inside AWX execution environment
+###############################################################################
 
-- name: Build consolidated Linux user compliance report
+- name: Generate central Linux user compliance CSV
   hosts: localhost
   gather_facts: false
 
   vars:
-    local_report_dir: /tmp/linux-user-compliance
+    central_report_dir: /tmp/linux-user-compliance
+
+    central_report_file: >-
+      /tmp/linux-user-compliance/all-linux-user-compliance.csv
 
   tasks:
 
-    - name: Ensure local report directory exists
+    ###########################################################################
+    # Create central AWX report directory
+    ###########################################################################
+
+    - name: Create central compliance directory
       ansible.builtin.file:
-        path: "{{ local_report_dir }}"
+        path: "{{ central_report_dir }}"
         state: directory
         mode: "0755"
 
 
-    - name: Find individual compliance CSV files
-      ansible.builtin.find:
-        paths: "{{ local_report_dir }}"
-        patterns: "*-user-compliance.csv"
-        file_type: file
-      register: compliance_files
+    ###########################################################################
+    # Build consolidated CSV
+    ###########################################################################
+
+    - name: Generate consolidated CSV report
+      ansible.builtin.copy:
+        dest: "{{ central_report_file }}"
+        mode: "0644"
+        content: |
+          "Server","Server IP","Username","UID","GID","Full Name","Account Status","Password Status","Password Last Changed","Password Expires","Password Minimum Days","Password Maximum Days","Password Warning Days","Password Inactive Days","Account Expires","User Creation Date Estimate","Groups","Sudo Access","Sudo Privileges","Home Directory","Login Shell"
+          {% for host in groups['linux'] | default([]) %}
+          {% for user in hostvars[host].compliance_accounts | default([]) %}
+          "{{ host | replace('"','""') }}","{{ hostvars[host].ansible_host | default(host) }}","{{ user.username | replace('"','""') }}","{{ user.uid }}","{{ user.gid }}","{{ user.full_name | replace('"','""') }}","{{ user.account_status }}","{{ user.password_status }}","{{ user.password_last_changed }}","{{ user.password_expires }}","{{ user.password_min_days }}","{{ user.password_max_days }}","{{ user.password_warning_days }}","{{ user.password_inactive_days }}","{{ user.account_expires }}","{{ user.creation_date_estimate | replace('"','""') }}","{{ user.groups | replace('"','""') }}","{{ user.sudo_access }}","{{ user.sudo_privileges | replace('"','""') }}","{{ user.home_directory | replace('"','""') }}","{{ user.login_shell | replace('"','""') }}"
+          {% endfor %}
+          {% endfor %}
 
 
-    - name: Display number of reports received
-      ansible.builtin.debug:
-        msg: >-
-          Received {{ compliance_files.files | length }}
-          Linux server compliance report(s).
+    ###########################################################################
+    # Check report
+    ###########################################################################
 
-
-    - name: Create consolidated CSV report
-      ansible.builtin.shell: |
-        set -o pipefail
-
-        OUTPUT="{{ local_report_dir }}/all-linux-user-compliance.csv"
-
-        rm -f "$OUTPUT"
-
-        FIRST=1
-
-        for FILE in {{ local_report_dir }}/*-user-compliance.csv
-        do
-
-            if [ ! -f "$FILE" ]; then
-                continue
-            fi
-
-            if [ "$FIRST" -eq 1 ]; then
-
-                cat "$FILE" > "$OUTPUT"
-
-                FIRST=0
-
-            else
-
-                tail -n +2 "$FILE" >> "$OUTPUT"
-
-            fi
-
-        done
-      args:
-        executable: /bin/bash
-      changed_when: true
-
-
-    - name: Check consolidated report
+    - name: Check central CSV report
       ansible.builtin.stat:
-        path: "{{ local_report_dir }}/all-linux-user-compliance.csv"
-      register: consolidated_report
+        path: "{{ central_report_file }}"
+      register: report_status
 
 
-    - name: Count consolidated compliance records
+    ###########################################################################
+    # Count lines
+    ###########################################################################
+
+    - name: Count compliance records
       ansible.builtin.shell: |
-        if [ -f "{{ local_report_dir }}/all-linux-user-compliance.csv" ]; then
-            LINES=$(wc -l < "{{ local_report_dir }}/all-linux-user-compliance.csv")
-            if [ "$LINES" -gt 0 ]; then
-                echo $((LINES - 1))
+        if [ -f "{{ central_report_file }}" ]; then
+
+            TOTAL_LINES=$(wc -l < "{{ central_report_file }}")
+
+            if [ "$TOTAL_LINES" -gt 0 ]; then
+                echo $((TOTAL_LINES - 1))
             else
                 echo 0
             fi
+
         else
+
             echo 0
+
         fi
       args:
         executable: /bin/bash
-      register: consolidated_count
+      register: compliance_count
       changed_when: false
 
 
-    - name: Display consolidated report summary
+    ###########################################################################
+    # Display summary
+    ###########################################################################
+
+    - name: Display central report details
       ansible.builtin.debug:
         msg:
-          - "Consolidated Report: {{ local_report_dir }}/all-linux-user-compliance.csv"
-          - "Report Size: {{ consolidated_report.stat.size | default(0) }} bytes"
-          - "Total User Records: {{ consolidated_count.stdout }}"
-          - "Servers Processed: {{ compliance_files.files | length }}"
+          - "============================================="
+          - "Linux User Compliance Report"
+          - "============================================="
+          - "Central Directory: {{ central_report_dir }}"
+          - "CSV File: {{ central_report_file }}"
+          - "File Size: {{ report_status.stat.size | default(0) }} bytes"
+          - "Linux Servers: {{ groups['linux'] | default([]) | length }}"
+          - "User Records: {{ compliance_count.stdout }}"
+          - "============================================="
 
 
-    - name: Show first 20 lines of consolidated report
+    ###########################################################################
+    # Preview CSV
+    ###########################################################################
+
+    - name: Read first 20 lines of compliance report
       ansible.builtin.command:
-        cmd: >-
-          head -20
-          {{ local_report_dir }}/all-linux-user-compliance.csv
-      register: report_preview
+        cmd: "head -20 {{ central_report_file }}"
+      register: compliance_preview
       changed_when: false
 
 
-    - name: Display report preview in AWX
+    - name: Display compliance report preview in AWX
       ansible.builtin.debug:
-        var: report_preview.stdout_lines
+        var: compliance_preview.stdout_lines
