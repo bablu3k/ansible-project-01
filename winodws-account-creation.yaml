@@ -1,0 +1,35 @@
+---
+- name: Create DevOps local account on Windows
+  hosts: windows
+  gather_facts: false
+
+  tasks:
+
+    - name: Create local devops account
+      ansible.windows.win_user:
+        name: devops
+        fullname: "DevOps User"
+        description: "Local DevOps account managed by Ansible AWX"
+        password: "{{ devops_password }}"
+        state: present
+        account_disabled: false
+        password_never_expires: true
+        user_cannot_change_password: false
+        update_password: on_create
+        groups:
+          - Users
+        groups_action: add
+      no_log: true
+
+    - name: Get devops account information
+      ansible.windows.win_user:
+        name: devops
+        state: query
+      register: devops_account
+
+    - name: Display account status
+      ansible.builtin.debug:
+        msg:
+          - "Username: {{ devops_account.name }}"
+          - "SID: {{ devops_account.sid }}"
+          - "Account disabled: {{ devops_account.account_disabled }}"
