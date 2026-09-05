@@ -1,6 +1,6 @@
 ---
 - name: Create devops Linux user
-  hosts: linux
+  hosts: linux01
   become: true
   gather_facts: false
 
