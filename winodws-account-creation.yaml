@@ -1,35 +1,46 @@
 ---
-- name: Create DevOps local account on Windows
+- name: Create DevOps administrator account on Windows
   hosts: win01
   gather_facts: false
 
   tasks:
 
-    - name: Create local devops account
+    - name: Create local devops user
       ansible.windows.win_user:
         name: devops
         fullname: "DevOps User"
-        description: "Local DevOps account managed by Ansible AWX"
-        password: "{{ devops_password }}"
+        description: "DevOps local administrator account managed by AWX"
+        password: "P@ssw0rd"
         state: present
         account_disabled: false
         password_never_expires: true
         user_cannot_change_password: false
-        update_password: on_create
+        update_password: always
         groups:
-          - Users
+          - Administrators
         groups_action: add
-      no_log: true
 
-    - name: Get devops account information
+    - name: Verify devops user
       ansible.windows.win_user:
         name: devops
         state: query
-      register: devops_account
+      register: devops_user
 
-    - name: Display account status
+    - name: Display devops account information
       ansible.builtin.debug:
         msg:
-          - "Username: {{ devops_account.name }}"
-          - "SID: {{ devops_account.sid }}"
-          - "Account disabled: {{ devops_account.account_disabled }}"
+          - "Username: {{ devops_user.name }}"
+          - "SID: {{ devops_user.sid }}"
+          - "Account disabled: {{ devops_user.account_disabled }}"
+
+    - name: Verify Administrators group membership
+      ansible.windows.win_shell: |
+        Get-LocalGroupMember -Group "Administrators" |
+        Where-Object { $_.Name -match 'devops$' } |
+        Select-Object -ExpandProperty Name
+      register: admin_membership
+      changed_when: false
+
+    - name: Display administrator membership
+      ansible.builtin.debug:
+        msg: "Administrator membership: {{ admin_membership.stdout | trim }}"
