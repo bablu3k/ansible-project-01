@@ -1,6 +1,6 @@
 ---
 - name: Test Windows managed nodes
-  hosts: windows
+  hosts: win01
   gather_facts: true
 
   tasks:
